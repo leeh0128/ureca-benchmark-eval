@@ -1,0 +1,958 @@
+#!/usr/bin/env python3
+#=========================================================================
+# sv-generate-agentic [options] prompt-filename
+#=========================================================================
+#
+# Drop-in agentic replacement for VerilogEval v2's `sv-generate`.
+#
+# Instead of a single LLM call, this runs a feedback loop:
+#   generate -> compile+simulate with iverilog -> on failure, feed the
+#   error back to the model -> regenerate -> repeat up to --max-iters.
+#
+# It is CLI-compatible with the stock sv-generate for the flags the
+# VerilogEval Makefile passes (--model --examples --rules --task
+# --temperature --top-p --output --verbose), so it can be dropped in
+# by pointing GENERATE_VERILOG at this script.
+#
+# Free-tier focus:
+#   - Targets Gemini via the OpenAI-compatible endpoint.
+#   - Rate-limit aware (configurable RPM, automatic backoff on 429).
+#   - Logs token usage for EVERY call to a per-sample JSON sidecar so
+#     total cost for paid models (e.g. Sonnet 4.6) can be extrapolated.
+#
+#  -v --verbose       Display prompts and responses
+#  -h --help          Display this message
+#  -m --model         LLM model (default: gemini-2.0-flash)
+#  -t --temperature   LLM temperature (default: 0.0)
+#  -p --top-p         LLM top_p (default: 0.01)
+#  -n --max-tokens    LLM max_tokens per call (default: 2048)
+#  -x --examples      In-context examples, 0-4 (default: 0)
+#  -r --rules         Include in-context coding rules
+#     --task          Task: spec-to-rtl | code-complete-iccad2023
+#     --output        File to write extracted code
+#     --max-iters     Max feedback-loop iterations (default: 5)
+#     --rpm           Max requests per minute, rate limiting (default: 12)
+#     --tokenlog      Token-usage JSON sidecar path (default: <output>.tokens.json)
+#
+#=========================================================================
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from collections import namedtuple
+
+#-------------------------------------------------------------------------
+# Command line
+#-------------------------------------------------------------------------
+
+class ArgParser(argparse.ArgumentParser):
+    def error(self, msg=""):
+        if msg:
+            print(f"\n ERROR: {msg}\n")
+        sys.exit(2)
+
+
+def parse_cmdline():
+    p = ArgParser(add_help=False)
+    p.add_argument("-h", "--help",        action="store_true")
+    p.add_argument("-v", "--verbose",     action="store_true")
+    p.add_argument("-m", "--model",       type=str,   default="gemini-2.0-flash")
+    p.add_argument("-t", "--temperature", type=float, default=0.0)
+    p.add_argument("-n", "--max-tokens",  type=int,   default=2048)
+    p.add_argument("-p", "--top-p",       type=float, default=0.01)
+    p.add_argument("-e", "--explain",     action="store_true")
+    p.add_argument("-x", "--examples",    type=int,   default=0)
+    p.add_argument("-r", "--rules",       action="store_true")
+    p.add_argument("--task",        type=str, default="spec-to-rtl")
+    p.add_argument("--output",      type=str, default="-")
+    p.add_argument("--max-iters",   type=int, default=5)
+    p.add_argument("--rpm",         type=int, default=12)
+    p.add_argument("--tokenlog",    type=str, default=None)
+    p.add_argument("--ureca-dir",   type=str, default="",
+                   help="Path to ureca_designs/ with Makefile + scripts/. "
+                        "When set, every iteration runs the URECA pipeline "
+                        "(make lint + make report) for structured feedback "
+                        "alongside the iverilog functional test.")
+    p.add_argument("prompt_filename")
+    opts = p.parse_args()
+    if opts.help:
+        print(__doc__ or "see header")
+        sys.exit(0)
+    return opts
+
+
+#-------------------------------------------------------------------------
+# Prompt templates (kept consistent with stock sv-generate)
+#-------------------------------------------------------------------------
+
+SYSTEM_MSG_SPEC_TO_RTL = (
+    "You are a Verilog RTL designer that only writes code using correct "
+    "Verilog syntax."
+)
+
+SYSTEM_MSG_CODE_COMPLETE = (
+    "You only complete chats with syntax correct Verilog code. End the "
+    "Verilog module code completion with 'endmodule'. Do not include "
+    "module, input and output definitions."
+)
+
+RULES_SUFFIX = """
+Here are some additional rules and coding conventions.
+
+ - Declare all ports and signals as logic; do not to use wire or reg.
+
+ - For combinational logic with an always block do not explicitly specify
+   the sensitivity list; instead use always @(*).
+
+ - All sized numeric constants must have a size greater than zero
+   (e.g, 0'b0 is not a valid expression).
+
+ - An always block must read at least one signal otherwise it will never
+   be executed; use an assign statement instead of an always block in
+   situations where there is no need to read any signals.
+
+ - if the module uses a synchronous reset signal, this means the reset
+   signal is sampled with respect to the clock. When implementing a
+   synchronous reset signal, do not include posedge reset in the
+   sensitivity list of any sequential always block.
+"""
+
+NO_EXPLAIN_SUFFIX = """
+Enclose your code with [BEGIN] and [DONE]. Only output the code snippet
+and do NOT output anything else.
+"""
+
+# Feedback message appended when a prior attempt failed iverilog testing.
+FEEDBACK_TEMPLATE = """
+Your previous Verilog solution was tested and FAILED. Here is the
+diagnostic output:
+
+--- BEGIN TEST OUTPUT ---
+{error_output}
+--- END TEST OUTPUT ---
+
+Analyze the failure and produce a corrected Verilog module.
+Common causes: syntax errors, port name/width mismatches, missing
+sensitivity entries, latch inference, incorrect reset behaviour, or
+functional logic errors.
+
+Enclose your corrected code with [BEGIN] and [DONE]. Only output the
+code snippet and do NOT output anything else.
+"""
+
+
+#-------------------------------------------------------------------------
+# Rate limiter
+#-------------------------------------------------------------------------
+
+class RateLimiter:
+    """Simple requests-per-minute limiter with monotonic spacing."""
+
+    def __init__(self, rpm):
+        self.min_interval = 60.0 / max(rpm, 1)
+        self.last_call = 0.0
+
+    def wait(self):
+        now = time.monotonic()
+        elapsed = now - self.last_call
+        if elapsed < self.min_interval:
+            time.sleep(self.min_interval - elapsed)
+        self.last_call = time.monotonic()
+
+
+#-------------------------------------------------------------------------
+# LLM call (Gemini via OpenAI-compatible endpoint)
+#-------------------------------------------------------------------------
+
+CallResult = namedtuple("CallResult",
+                        ["content", "prompt_tokens", "completion_tokens",
+                         "total_tokens"])
+
+
+def make_client(model):
+    """
+    Build a model client.  Routing is by model-name prefix:
+      gemini-*  -> OpenAI-compatible client to Google's endpoint
+      claude-*  -> native Anthropic SDK client
+      <other>   -> OpenAI native (for openai-* and others)
+    Imports are deferred so users only need the SDK they actually use.
+    """
+    if model.startswith("claude-"):
+        try:
+            from anthropic import Anthropic
+        except ImportError:
+            sys.exit("[ERR] anthropic package not installed. "
+                     "Run: pip install anthropic")
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            sys.exit("[ERR] ANTHROPIC_API_KEY not set. "
+                     "Get one at https://console.anthropic.com")
+        return Anthropic(api_key=api_key)
+
+    try:
+        from openai import OpenAI
+    except ImportError:
+        sys.exit("[ERR] openai package not installed. Run: pip install openai")
+
+    if model.startswith("gemini"):
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            sys.exit("[ERR] GEMINI_API_KEY not set. "
+                     "Get one free at https://aistudio.google.com")
+        return OpenAI(
+            api_key=api_key,
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        )
+
+    # OpenAI native (for later paid runs)
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        sys.exit("[ERR] OPENAI_API_KEY not set.")
+    return OpenAI(api_key=api_key)
+
+
+def _split_system_messages(messages):
+    """
+    Anthropic expects a top-level `system` string and a `messages` list
+    that contains only user/assistant turns. OpenAI-compatible APIs
+    accept inline system messages. This helper extracts any leading
+    system messages and concatenates them.
+
+    Returns (system_str, non_system_messages).
+    """
+    system_parts = []
+    non_sys = []
+    for m in messages:
+        if m.get("role") == "system":
+            system_parts.append(m.get("content", ""))
+        else:
+            non_sys.append(m)
+    return "\n\n".join(system_parts), non_sys
+
+
+def call_llm(client, model, messages, temperature, top_p, max_tokens,
+             limiter, verbose):
+    """
+    One LLM call with rate limiting and exponential backoff on errors
+    (notably 429 rate-limit responses, and Anthropic's 529 overload).
+    Dispatches by model name: claude-* uses the Anthropic SDK shape,
+    everything else uses the OpenAI-compatible chat.completions shape.
+    Returns a CallResult with token counts normalized into
+    prompt_tokens / completion_tokens / total_tokens.
+    """
+    is_claude = model.startswith("claude-")
+    backoff = 20.0
+    for attempt in range(6):
+        limiter.wait()
+        try:
+            if is_claude:
+                # Anthropic: messages.create with separate system param.
+                # max_tokens is required by Anthropic; we always pass it.
+                system_str, msgs = _split_system_messages(messages)
+                kwargs = {
+                    "model": model,
+                    "messages": msgs,
+                    "max_tokens": max_tokens or 4096,
+                    "temperature": temperature,
+                }
+                if system_str:
+                    kwargs["system"] = system_str
+                # Anthropic requires that ONLY ONE of temperature/top_p
+                # be specified (sending both returns 400). Prefer the
+                # explicit temperature setting; only fall back to top_p
+                # if temperature wasn't given.
+                if temperature is None:
+                    kwargs.pop("temperature", None)
+                    if top_p is not None and 0.0 < top_p <= 1.0:
+                        kwargs["top_p"] = top_p
+                # else: keep temperature, drop top_p entirely
+                resp = client.messages.create(**kwargs)
+
+                # Concatenate all text blocks in the response (typically one)
+                text_blocks = [
+                    b.text for b in resp.content
+                    if getattr(b, "type", None) == "text"
+                       and hasattr(b, "text")
+                ]
+                content = "".join(text_blocks)
+
+                u = resp.usage
+                p_tok = getattr(u, "input_tokens", 0) or 0
+                c_tok = getattr(u, "output_tokens", 0) or 0
+                return CallResult(
+                    content=content,
+                    prompt_tokens=p_tok,
+                    completion_tokens=c_tok,
+                    total_tokens=p_tok + c_tok,
+                )
+
+            # OpenAI / Gemini (OpenAI-compatible) path
+            resp = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+            )
+            usage = resp.usage
+            return CallResult(
+                content=resp.choices[0].message.content or "",
+                prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+                completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
+                total_tokens=getattr(usage, "total_tokens", 0) or 0,
+            )
+        except Exception as e:
+            msg = str(e)
+            # Classify the error to decide whether to retry.
+            #   4xx (other than 429) — permanent client errors; do NOT retry
+            #   429                   — rate limit; retry with longer backoff
+            #   5xx, 529              — server issues; retry with backoff
+            #   network errors        — retry
+            lower = msg.lower()
+            is_rate = ("429" in msg or "rate" in lower or "quota" in lower)
+            is_overload = ("529" in msg or "overload" in lower)
+            # Detect non-retryable 4xx (400 bad request, 401 unauth, 403
+            # forbidden, 404 not found). These will never succeed on
+            # retry — fail fast so we don't burn the iteration budget.
+            non_retryable = False
+            for code in ("400", "401", "403", "404"):
+                if f"Error code: {code}" in msg or f"code: {code}" in msg:
+                    non_retryable = True
+                    break
+
+            if non_retryable:
+                if verbose:
+                    print(f"[ERR] LLM call failed with non-retryable error: "
+                          f"{type(e).__name__}: {msg[:300]}", file=sys.stderr)
+                # Return empty result so the loop can break cleanly
+                return CallResult(content="", prompt_tokens=0,
+                                  completion_tokens=0, total_tokens=0)
+
+            wait = backoff * (2 if (is_rate or is_overload) else 1)
+            if verbose:
+                print(f"[WARN] LLM call failed (attempt {attempt+1}): {type(e).__name__}: {msg[:200]}",
+                      file=sys.stderr)
+                print(f"[WARN] retrying in {wait:.0f}s", file=sys.stderr)
+            time.sleep(wait)
+            backoff = min(backoff * 1.8, 180.0)
+    # All retries exhausted
+    return CallResult(content="", prompt_tokens=0, completion_tokens=0,
+                      total_tokens=0)
+
+
+#-------------------------------------------------------------------------
+# Code extraction (kept consistent with stock sv-generate spec-to-rtl)
+#-------------------------------------------------------------------------
+
+def extract_code(response_content):
+    """
+    Extract Verilog from a model response.  Tries multiple strategies in
+    order, falling through if each fails, and finally sanitizes the output
+    to guarantee no fence markers leak into the .sv file.
+
+    Strategies, in order:
+      1. [BEGIN] ... [DONE] block (the format we ask for in the prompt)
+      2. Triple-backtick fenced block (```verilog ... ``` or just ``` ... ```)
+      3. Raw module ... endmodule extraction (no markers at all)
+      4. Last resort: full response
+
+    Final step: strip any stray fence/tag markers from the extracted output.
+    This last step exists because Gemini sometimes emits fences in subtle
+    ways (extra whitespace, missing closing fence, language tag with extra
+    chars) that defeat the primary parsers, and we never want those markers
+    to reach iverilog.
+    """
+    if not response_content:
+        return ""
+
+    def _sanitize(code):
+        """Strip any leading/trailing fence or tag lines that snuck through."""
+        if not code:
+            return ""
+        out_lines = []
+        for ln in code.splitlines():
+            stripped = ln.strip()
+            # Drop lines that are only a fence (possibly with a language tag)
+            if stripped.startswith("```"):
+                continue
+            # Drop standalone [BEGIN]/[DONE] lines
+            if stripped in {"[BEGIN]", "[DONE]"}:
+                continue
+            out_lines.append(ln)
+        # Trim leading/trailing blank lines
+        while out_lines and not out_lines[0].strip():
+            out_lines.pop(0)
+        while out_lines and not out_lines[-1].strip():
+            out_lines.pop()
+        return "\n".join(out_lines)
+
+    lines = response_content.splitlines()
+
+    # ---- Strategy 1: [BEGIN] / [DONE] tags ----
+    found_start = found_end = False
+    code_lines = []
+    for line in lines:
+        if not found_start:
+            if line.strip() == "[BEGIN]":
+                found_start = True
+            elif line.lstrip().startswith("[BEGIN]"):
+                code_lines.append(line.lstrip().replace("[BEGIN]", "", 1))
+                found_start = True
+        elif not found_end:
+            if line.strip() == "[DONE]":
+                found_end = True
+            elif line.rstrip().endswith("[DONE]"):
+                code_lines.append(line.rstrip().rsplit("[DONE]", 1)[0])
+                found_end = True
+            else:
+                code_lines.append(line)
+    if found_start and code_lines:
+        # Even without a closing [DONE], salvage what we have
+        return _sanitize("\n".join(code_lines))
+
+    # ---- Strategy 2: triple-backtick fenced block ----
+    # Tolerant: matches ```, ```verilog, ```sv, ```systemverilog etc.
+    # Handles missing closing fence (just takes everything after the opener).
+    fence_re = re.compile(r"^\s*```")
+    in_fence = False
+    code_lines = []
+    for line in lines:
+        if fence_re.match(line):
+            if not in_fence:
+                in_fence = True
+                continue
+            else:
+                # Closing fence
+                break
+        if in_fence:
+            code_lines.append(line)
+    if code_lines:
+        return _sanitize("\n".join(code_lines))
+
+    # ---- Strategy 3: raw module ... endmodule ----
+    # No markers at all — pull from 'module' to 'endmodule' inclusive.
+    mod_start = mod_end = None
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if mod_start is None and stripped.startswith("module"):
+            mod_start = i
+        if mod_start is not None and stripped.startswith("endmodule"):
+            mod_end = i
+            break
+    if mod_start is not None and mod_end is not None:
+        return _sanitize("\n".join(lines[mod_start:mod_end + 1]))
+
+    # ---- Last resort: sanitize the raw response and hope for the best ----
+    return _sanitize(response_content)
+
+
+#-------------------------------------------------------------------------
+# iverilog test (mirrors the Makefile's per-problem compile+run)
+#-------------------------------------------------------------------------
+
+def run_iverilog_test(candidate_sv, ref_sv, test_sv, workdir, timeout=30):
+    """
+    Compile candidate + ref + test with iverilog and run.  Mirrors the
+    VerilogEval Makefile recipe:
+
+        iverilog -Wall -Winfloop -Wno-timescale -g2012 -s tb -o bin \\
+                 candidate.sv test.sv ref.sv
+        timeout 30 ./bin
+
+    Returns (passed: bool, output: str).
+    """
+    bin_path = os.path.join(workdir, "_agentic_test_bin")
+    cand_path = os.path.join(workdir, "_agentic_candidate.sv")
+
+    with open(cand_path, "w") as f:
+        f.write(candidate_sv)
+
+    compile_cmd = [
+        "iverilog", "-Wall", "-Winfloop", "-Wno-timescale",
+        "-g2012", "-s", "tb", "-o", bin_path,
+        cand_path, test_sv, ref_sv,
+    ]
+    try:
+        comp = subprocess.run(compile_cmd, capture_output=True, text=True,
+                              timeout=60)
+    except subprocess.TimeoutExpired:
+        return False, "COMPILE TIMEOUT"
+    except FileNotFoundError:
+        return False, "iverilog not found on PATH"
+
+    compile_out = (comp.stdout or "") + (comp.stderr or "")
+    if comp.returncode != 0 or not os.path.exists(bin_path):
+        return False, "COMPILE ERROR\n" + compile_out
+
+    # Run the simulation
+    try:
+        run = subprocess.run([bin_path], capture_output=True, text=True,
+                             timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, compile_out + "\nTIMEOUT"
+
+    run_out = (run.stdout or "") + (run.stderr or "")
+    full_out = compile_out + run_out
+
+    # VerilogEval test benches print mismatch counts; the reference
+    # convention is that a passing run reports no mismatches.
+    if re.search(r"Mismatches: 0 in \d+ samples", run_out):
+        return True, full_out
+    if "Mismatches:" in run_out:
+        return False, full_out
+    # No explicit mismatch line — treat compile-clean + clean run as
+    # ambiguous-pass only if there's an explicit pass marker.
+    if re.search(r"\bALL_PASS\b|\bPASSED\b", run_out):
+        return True, full_out
+    return False, full_out
+
+
+#-------------------------------------------------------------------------
+# URECA pipeline invocation — the lint-driven feedback channel
+#-------------------------------------------------------------------------
+
+def run_ureca_lint(candidate_sv, ureca_dir, problem_id, verbose=False):
+    """
+    Run the URECA Makefile's lint stage against the candidate.
+
+    Stages the candidate code into <ureca_dir>/rtl/, invokes
+    `make lint` and `make report`, then reads out/feedback.json.
+
+    Returns a 3-tuple (status, findings_list, raw_output) where status is:
+      'pass'  — lint passed cleanly, no errors
+      'fail'  — lint found errors (genuine signal for the agent)
+      'error' — infrastructure issue (missing dir, make broken, etc.);
+                caller should fall back to iverilog-only feedback
+    """
+    import shutil
+
+    if not ureca_dir or not os.path.isdir(ureca_dir):
+        return 'error', [], f"URECA dir not found: {ureca_dir}"
+
+    makefile = os.path.join(ureca_dir, "Makefile")
+    if not os.path.isfile(makefile):
+        return 'error', [], f"Makefile not found in URECA dir: {makefile}"
+
+    rtl_dir = os.path.join(ureca_dir, "rtl")
+    out_dir = os.path.join(ureca_dir, "out")
+    os.makedirs(rtl_dir, exist_ok=True)
+
+    # Clear previous candidate(s). We only remove .sv/.v files in rtl/
+    # to avoid trashing user files like includes/.
+    for f in os.listdir(rtl_dir):
+        full = os.path.join(rtl_dir, f)
+        if os.path.isfile(full) and (f.endswith(".sv") or f.endswith(".v")):
+            try:
+                os.remove(full)
+            except OSError:
+                pass
+
+    # Stage candidate
+    candidate_path = os.path.join(rtl_dir, "candidate.sv")
+    try:
+        with open(candidate_path, "w") as fh:
+            fh.write(candidate_sv)
+    except OSError as e:
+        return 'error', [], f"Failed to stage candidate: {e}"
+
+    # Wipe out/ so we don't read stale feedback from a prior problem
+    if os.path.isdir(out_dir):
+        try:
+            shutil.rmtree(out_dir)
+        except OSError:
+            pass  # not fatal; make will overwrite
+
+    # Run `make lint`. We deliberately DON'T fail on non-zero exit —
+    # lint failure IS the signal we want. We just need to capture
+    # the output and parse the structured feedback.
+    env = os.environ.copy()
+    try:
+        result = subprocess.run(
+            ["make", "-C", ureca_dir, "lint"],
+            capture_output=True, text=True, timeout=60, env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return 'error', [], "make lint timed out (>60s)"
+    except FileNotFoundError:
+        return 'error', [], "'make' not found on PATH"
+
+    make_out = (result.stdout or "") + (result.stderr or "")
+
+    # Run `make report` to produce feedback.json. May fail if there
+    # are no logs yet; that's OK — we have lint.log to fall back on.
+    try:
+        subprocess.run(
+            ["make", "-C", ureca_dir, "report"],
+            capture_output=True, text=True, timeout=30, env=env,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass  # non-fatal
+
+    # Parse structured findings from feedback.json if available;
+    # else from lint.log directly.
+    findings = []
+    feedback_path = os.path.join(out_dir, "feedback.json")
+    lint_log_path = os.path.join(out_dir, "lint.log")
+
+    if os.path.isfile(feedback_path):
+        try:
+            with open(feedback_path) as fh:
+                fb = json.load(fh)
+            # Filter to lint-category findings only — sim/synth findings
+            # aren't relevant at this stage and may be stale.
+            all_findings = fb.get("findings", [])
+            findings = [f for f in all_findings
+                        if f.get("category", "").lower() == "lint"]
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Fallback: parse lint.log directly if feedback.json was unhelpful
+    if not findings and os.path.isfile(lint_log_path):
+        try:
+            with open(lint_log_path) as fh:
+                for line in fh:
+                    if line.startswith("%Error"):
+                        findings.append({
+                            "severity": "high",
+                            "category": "lint",
+                            "message": line.strip(),
+                        })
+                    elif line.startswith("%Warning"):
+                        findings.append({
+                            "severity": "low",
+                            "category": "lint",
+                            "message": line.strip(),
+                        })
+        except OSError:
+            pass
+
+    # Determine pass/fail status
+    has_error = any(f.get("severity") == "high" for f in findings)
+    if has_error:
+        return 'fail', findings, make_out
+
+    # If make exited non-zero but we found no high-severity findings,
+    # the failure was structural (missing TOP module, etc.). Treat as
+    # infrastructure error so we don't penalize the agent.
+    if result.returncode != 0 and not findings:
+        return 'error', [], (
+            f"make lint exited {result.returncode} but produced no "
+            f"structured findings. Output tail:\n"
+            + make_out[-800:]
+        )
+
+    return 'pass', findings, make_out
+
+
+def format_lint_findings(findings, max_findings=10):
+    """Format lint findings into a compact string for the LLM."""
+    if not findings:
+        return "(no lint issues)"
+    lines = []
+    high = [f for f in findings if f.get("severity") == "high"]
+    low = [f for f in findings if f.get("severity") != "high"]
+    if high:
+        lines.append(f"Lint errors ({len(high)}):")
+        for f in high[:max_findings]:
+            lines.append(f"  - {f.get('message','(no message)')[:200]}")
+    if low:
+        lines.append(f"Lint warnings ({len(low)}):")
+        for f in low[:max_findings]:
+            lines.append(f"  - {f.get('message','(no message)')[:200]}")
+    return "\n".join(lines)
+
+
+def find_ref_and_test(prompt_filename):
+    """
+    Given ProbXXX_prompt.txt, locate ProbXXX_ref.sv and ProbXXX_test.sv
+    in the same directory (VerilogEval dataset layout).
+    """
+    if not prompt_filename.endswith("_prompt.txt"):
+        return None, None
+    base = prompt_filename[:-len("_prompt.txt")]
+    ref = base + "_ref.sv"
+    test = base + "_test.sv"
+    return (ref if os.path.exists(ref) else None,
+            test if os.path.exists(test) else None)
+
+
+#-------------------------------------------------------------------------
+# Prompt assembly
+#-------------------------------------------------------------------------
+
+def build_initial_prompt(prompt_text, task, use_rules, examples, script_dir):
+    """Assemble the first-turn user prompt (spec-to-rtl framing)."""
+    full = ""
+
+    if examples != 0:
+        ex_file = os.path.join(
+            script_dir,
+            f"verilog-example-prefix_{task}_{examples}-shot.txt")
+        if os.path.exists(ex_file):
+            with open(ex_file) as f:
+                full += f.read()
+
+    if task == "spec-to-rtl":
+        full += "\nQuestion:\n"
+        full += prompt_text.strip() + "\n"
+        if use_rules:
+            full += RULES_SUFFIX
+        full = full.rstrip() + "\n" + NO_EXPLAIN_SUFFIX
+        full += "\nAnswer:\n"
+    else:  # code-complete fallback
+        prefixed = []
+        prefix = True
+        for line in prompt_text.splitlines():
+            if "module TopModule" in line:
+                prefixed.append("")
+                prefix = False
+            prefixed.append(("// " + line) if prefix else line)
+        full += "\n".join(prefixed)
+
+    return full
+
+
+#-------------------------------------------------------------------------
+# Main
+#-------------------------------------------------------------------------
+
+def main():
+    opts = parse_cmdline()
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        script_dir = os.getcwd()
+    verbose = opts.verbose
+
+    # Resolve token-log path
+    tokenlog = opts.tokenlog
+    if tokenlog is None and opts.output != "-":
+        tokenlog = opts.output + ".tokens.json"
+
+    system_msg = (SYSTEM_MSG_SPEC_TO_RTL if opts.task == "spec-to-rtl"
+                  else SYSTEM_MSG_CODE_COMPLETE)
+
+    # Read the problem prompt
+    with open(opts.prompt_filename) as f:
+        prompt_text = f.read()
+
+    problem = "?"
+    if opts.prompt_filename.endswith("_prompt.txt"):
+        problem = os.path.basename(opts.prompt_filename[:-len("_prompt.txt")])
+
+    # Locate ref + test for the feedback loop
+    ref_sv, test_sv = find_ref_and_test(opts.prompt_filename)
+    can_test = ref_sv is not None and test_sv is not None
+    if not can_test and verbose:
+        print(f"[WARN] ref/test not found for {problem}; running "
+              f"single-shot (no feedback loop possible)", file=sys.stderr)
+
+    workdir = (os.path.dirname(os.path.abspath(opts.output))
+               if opts.output != "-" else os.getcwd())
+    os.makedirs(workdir, exist_ok=True)
+
+    # Set up LLM
+    client = make_client(opts.model)
+    limiter = RateLimiter(opts.rpm)
+
+    # Token accounting
+    token_records = []
+    cumulative = {"prompt_tokens": 0, "completion_tokens": 0,
+                  "total_tokens": 0, "num_calls": 0}
+
+    # ----- Feedback loop -----
+    messages = [
+        {"role": "system", "content": system_msg},
+        {"role": "user",
+         "content": build_initial_prompt(prompt_text, opts.task,
+                                         opts.rules, opts.examples,
+                                         script_dir)},
+    ]
+
+    best_code = ""
+    passed = False
+    iterations_used = 0
+    # Track per-iteration outcomes for the sidecar (research data).
+    iteration_outcomes = []
+
+    use_ureca = bool(opts.ureca_dir)
+    if use_ureca and verbose:
+        print(f"[{problem}] URECA pipeline enabled at: {opts.ureca_dir}",
+              file=sys.stderr)
+
+    for iteration in range(1, opts.max_iters + 1):
+        iterations_used = iteration
+        if verbose:
+            print(f"\n[{problem}] === iteration {iteration}/{opts.max_iters} ===",
+                  file=sys.stderr)
+
+        result = call_llm(client, opts.model, messages,
+                          opts.temperature, opts.top_p, opts.max_tokens,
+                          limiter, verbose)
+
+        token_records.append({
+            "iteration": iteration,
+            "prompt_tokens": result.prompt_tokens,
+            "completion_tokens": result.completion_tokens,
+            "total_tokens": result.total_tokens,
+        })
+        cumulative["prompt_tokens"]     += result.prompt_tokens
+        cumulative["completion_tokens"] += result.completion_tokens
+        cumulative["total_tokens"]      += result.total_tokens
+        cumulative["num_calls"]         += 1
+
+        if not result.content:
+            if verbose:
+                print(f"[{problem}] empty response, aborting loop",
+                      file=sys.stderr)
+            iteration_outcomes.append({
+                "iteration": iteration, "lint": "skip",
+                "sim": "skip", "result": "empty_response"})
+            break
+
+        code = extract_code(result.content)
+        best_code = code  # keep latest as best-effort even if it fails
+
+        # Record assistant turn for conversation continuity
+        messages.append({"role": "assistant", "content": result.content})
+
+        if not can_test:
+            # No ref/test: cannot iterate, accept single shot
+            if verbose:
+                print(f"[{problem}] no test harness; accepting first sample",
+                      file=sys.stderr)
+            iteration_outcomes.append({
+                "iteration": iteration, "lint": "skip",
+                "sim": "skip", "result": "no_test_harness"})
+            break
+
+        # ---- URECA lint stage (if enabled) ----
+        lint_status = "skip"
+        lint_findings = []
+        lint_raw = ""
+        if use_ureca:
+            lint_status, lint_findings, lint_raw = run_ureca_lint(
+                code, opts.ureca_dir, problem, verbose=verbose)
+            if verbose:
+                print(f"[{problem}] lint status: {lint_status} "
+                      f"(findings: {len(lint_findings)})",
+                      file=sys.stderr)
+
+        # If URECA lint failed (genuine errors), feed back lint diagnostics
+        # FIRST and skip iverilog for this iteration. Sim against broken
+        # code wastes a compile and produces a confusing error message.
+        if lint_status == 'fail':
+            iteration_outcomes.append({
+                "iteration": iteration, "lint": "fail",
+                "sim": "skip", "result": "lint_errors",
+                "num_lint_findings": len(lint_findings)})
+
+            if iteration < opts.max_iters:
+                lint_msg = format_lint_findings(lint_findings)
+                if len(lint_msg) > 3000:
+                    lint_msg = lint_msg[:3000] + "\n...[truncated]"
+                feedback_body = (
+                    "Your previous Verilog FAILED LINTING. Fix these "
+                    "lint errors first — they must be resolved before "
+                    "functional testing can run.\n\n"
+                    f"--- LINT FINDINGS ---\n{lint_msg}\n"
+                    "--- END FINDINGS ---\n\n"
+                    "Produce a corrected Verilog module. "
+                    "Enclose your code with [BEGIN] and [DONE]."
+                )
+                messages.append({"role": "user", "content": feedback_body})
+            continue
+
+        # ---- iverilog functional test stage ----
+        ok, test_output = run_iverilog_test(code, ref_sv, test_sv, workdir)
+
+        if ok:
+            passed = True
+            iteration_outcomes.append({
+                "iteration": iteration,
+                "lint": lint_status, "sim": "pass", "result": "passed",
+                "num_lint_findings": len(lint_findings)})
+            if verbose:
+                print(f"[{problem}] PASSED on iteration {iteration}",
+                      file=sys.stderr)
+            break
+
+        # Sim failed — feed back the iverilog diagnostic. Include any
+        # lint warnings (low-severity) as additional context.
+        iteration_outcomes.append({
+            "iteration": iteration,
+            "lint": lint_status, "sim": "fail", "result": "sim_mismatch",
+            "num_lint_findings": len(lint_findings)})
+
+        if verbose:
+            print(f"[{problem}] FAILED iteration {iteration}; "
+                  f"feeding back sim diagnostics", file=sys.stderr)
+
+        if iteration < opts.max_iters:
+            err = test_output.strip()
+            if len(err) > 3000:
+                err = err[:1500] + "\n...[truncated]...\n" + err[-1500:]
+            # Prepend any lint warnings so the model sees both signals
+            extra = ""
+            warns = [f for f in lint_findings
+                     if f.get("severity") != "high"]
+            if warns:
+                extra = ("\n--- LINT WARNINGS (advisory) ---\n"
+                         + format_lint_findings(warns)
+                         + "\n--- END WARNINGS ---\n")
+            messages.append({
+                "role": "user",
+                "content": FEEDBACK_TEMPLATE.format(error_output=err) + extra,
+            })
+
+    # ----- Write the output .sv in the format the harness expects -----
+    # The harness reads opts.output as the candidate sample file.
+    out_handle = (open(opts.output, "w") if opts.output != "-"
+                  else sys.stdout)
+    print("", file=out_handle)
+    for line in best_code.splitlines():
+        print(line, file=out_handle)
+    print("", file=out_handle)
+    if not best_code.strip():
+        print("// VERILOG-EVAL: agentic generation produced no code",
+              file=out_handle)
+    if out_handle is not sys.stdout:
+        out_handle.close()
+
+    # ----- Write token log sidecar -----
+    if tokenlog:
+        with open(tokenlog, "w") as f:
+            json.dump({
+                "problem": problem,
+                "model": opts.model,
+                "task": opts.task,
+                "passed": passed,
+                "iterations_used": iterations_used,
+                "max_iters": opts.max_iters,
+                "can_test": can_test,
+                "ureca_enabled": use_ureca,
+                "ureca_dir": opts.ureca_dir if use_ureca else "",
+                "iteration_outcomes": iteration_outcomes,
+                "per_iteration": token_records,
+                "cumulative": cumulative,
+            }, f, indent=2)
+
+    # ----- Console summary (shows up in sv-generate.log) -----
+    print("")
+    print(f"problem          = {problem}")
+    print(f"model            = {opts.model}")
+    print(f"agentic_passed   = {passed}")
+    print(f"iterations_used  = {iterations_used}")
+    print(f"prompt_tokens    = {cumulative['prompt_tokens']}")
+    print(f"resp_tokens      = {cumulative['completion_tokens']}")
+    print(f"total_tokens     = {cumulative['total_tokens']}")
+    print(f"num_llm_calls    = {cumulative['num_calls']}")
+    print("")
+
+
+if __name__ == "__main__":
+    main()
