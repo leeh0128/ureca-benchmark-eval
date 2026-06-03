@@ -27,7 +27,6 @@ import glob
 from collections import OrderedDict
 from dataclasses import dataclass
 
-from langchain.schema   import SystemMessage, HumanMessage
 
 #-------------------------------------------------------------------------
 # Command line processing
